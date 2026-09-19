@@ -1,5 +1,6 @@
 require('dotenv').config();
 const express = require('express');
+const rateLimit = require('express-rate-limit');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const fs = require('fs');
@@ -7,6 +8,11 @@ const { Octokit } = require('octokit');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// Behind a proxy/load balancer, req.ip is the proxy address unless Express is
+// told how many hops to trust. Without this, IP-keyed rate limiting collapses
+// every caller into a single bucket. Set TRUST_PROXY_HOPS=0 when exposed directly.
+app.set('trust proxy', Number(process.env.TRUST_PROXY_HOPS ?? 1));
 
 // ============================================================
 // 🔐 CONFIGURATION
@@ -68,18 +74,41 @@ async function getInstallationToken(installationId) {
 // 🔍 WEBHOOK SIGNATURE VERIFICATION
 // ============================================================
 function verifyWebhookSignature(payload, signatureHeader) {
-  if (!WEBHOOK_SECRET) return true; // Skip if no secret configured
-  
-  const signature = `sha256=${crypto
+  // Fail closed: a missing secret must never mean "accept anything".
+  if (!WEBHOOK_SECRET) {
+    console.error('❌ GITHUB_WEBHOOK_SECRET is not set — rejecting webhook');
+    return false;
+  }
+
+  if (typeof signatureHeader !== 'string') return false;
+
+  const expected = `sha256=${crypto
     .createHmac('sha256', WEBHOOK_SECRET)
     .update(payload)
     .digest('hex')}`;
-  
-  return crypto.timingSafeEqual(
-    Buffer.from(signature),
-    Buffer.from(signatureHeader || '')
-  );
+
+  const a = Buffer.from(expected);
+  const b = Buffer.from(signatureHeader);
+
+  // timingSafeEqual throws when lengths differ — compare first.
+  if (a.length !== b.length) return false;
+
+  return crypto.timingSafeEqual(a, b);
 }
+
+// ============================================================
+// 🚦 RATE LIMITING — Webhook
+// ============================================================
+// Bounds request volume per IP so a flood cannot burn CPU on signature
+// verification and JSON parsing (CWE-770 / CWE-400). Keyed on req.ip,
+// which requires the `trust proxy` setting above to be correct.
+const webhookLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 นาที
+  limit: 100,               // 100 คำขอต่อ IP ต่อหน้าต่าง
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: { error: 'Too many requests. Please try again later.' },
+});
 
 // ============================================================
 // 📡 WEBHOOK ENDPOINT
@@ -87,6 +116,7 @@ function verifyWebhookSignature(payload, signatureHeader) {
 // Use raw body for signature verification
 app.post(
   '/webhook/github',
+  webhookLimiter,   // ← ก่อน parse/ตรวจสอบ เพื่อกัน CPU จากการโจมตี
   express.raw({ type: 'application/json' }),
   async (req, res) => {
     try {
